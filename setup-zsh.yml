@@ -1,0 +1,82 @@
+---
+- name: Setup Zsh with Oh My Zsh, plugins, and Powerlevel10k theme as root user
+  hosts: all
+  become: yes   # You can keep this if connecting as non-root, but commands run as root
+  vars:
+    user_name: root
+    oh_my_zsh_install_url: https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh
+    zsh_custom_dir: "/root/.oh-my-zsh/custom"
+    zshrc_path: "/root/.zshrc"
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - zsh
+          - git
+          - wget
+        state: present
+        update_cache: yes
+
+    - name: Ensure zsh is default shell for root user
+      user:
+        name: root
+        shell: /usr/bin/zsh
+
+    - name: Check if Oh My Zsh is already installed
+      stat:
+        path: "/root/.oh-my-zsh"
+      register: oh_my_zsh_dir
+
+    - name: Install Oh My Zsh
+      shell: "sh -c \"$(wget {{ oh_my_zsh_install_url }} -O -)\""
+      args:
+        creates: "/root/.oh-my-zsh"
+      when: not oh_my_zsh_dir.stat.exists
+
+    - name: Clone zsh-autosuggestions plugin
+      git:
+        repo: https://github.com/zsh-users/zsh-autosuggestions
+        dest: "{{ zsh_custom_dir }}/plugins/zsh-autosuggestions"
+        update: yes
+
+    - name: Clone zsh-syntax-highlighting plugin
+      git:
+        repo: https://github.com/zsh-users/zsh-syntax-highlighting.git
+        dest: "{{ zsh_custom_dir }}/plugins/zsh-syntax-highlighting"
+        update: yes
+
+    - name: Clone powerlevel10k theme
+      git:
+        repo: https://github.com/romkatv/powerlevel10k.git
+        depth: 1
+        dest: "{{ zsh_custom_dir }}/themes/powerlevel10k"
+        update: yes
+
+    - name: Backup existing .zshrc if present
+      shell: cp -n {{ zshrc_path }} {{ zshrc_path }}.backup-{{ ansible_date_time.iso8601 }}
+      args:
+        warn: false
+      ignore_errors: yes
+
+    - name: Create .zshrc with plugins and theme configured
+      copy:
+        dest: "{{ zshrc_path }}"
+        content: |
+          export ZSH="$HOME/.oh-my-zsh"
+
+          ZSH_THEME="powerlevel10k/powerlevel10k"
+
+          plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
+
+          source $ZSH/oh-my-zsh.sh
+
+          # Enable syntax highlighting plugin
+          source $ZSH/custom/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+
+    - name: Ensure ownership of /root files
+      file:
+        path: "/root"
+        owner: root
+        group: root
+        recurse: yes
