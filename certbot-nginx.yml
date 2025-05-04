@@ -1,0 +1,116 @@
+---
+- name: Install Certbot, obtain HTTPS certificate, and configure Nginx
+  hosts: all
+  become: yes
+
+  vars:
+    domain_name: "{{ domain_name | default('example.com') }}"
+    email: "{{ email | default('admin@example.com') }}"
+    webroot_path: "/var/www/html"
+    webserver_service: "nginx"
+    nginx_sites_available: "/etc/nginx/sites-available"
+    nginx_sites_enabled: "/etc/nginx/sites-enabled"
+    nginx_conf_file: "{{ nginx_sites_available }}/{{ domain_name }}"
+
+  tasks:
+    - name: Install Nginx and Certbot packages (Ubuntu/Debian)
+      apt:
+        name:
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+        state: present
+        update_cache: yes
+
+    - name: Ensure Nginx is started and enabled
+      systemd:
+        name: "{{ webserver_service }}"
+        state: started
+        enabled: yes
+
+    - name: Create basic Nginx config (HTTP only) if not present
+      copy:
+        dest: "{{ nginx_conf_file }}"
+        content: |
+          server {
+              listen 80;
+              server_name {{ domain_name }};
+
+              root {{ webroot_path }};
+              index index.html index.htm;
+
+              location /.well-known/acme-challenge/ {
+                  root {{ webroot_path }};
+              }
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+          }
+        owner: root
+        group: root
+        mode: "0644"
+        backup: yes
+        force: no  # Do not overwrite if file exists
+
+    - name: Enable site by creating symlink in sites-enabled
+      file:
+        src: "{{ nginx_conf_file }}"
+        dest: "{{ nginx_sites_enabled }}/{{ domain_name }}"
+        state: link
+      notify: Reload nginx
+
+    - name: Test Nginx configuration
+      command: nginx -t
+      register: nginx_test
+      failed_when: nginx_test.rc != 0
+      changed_when: false
+
+    - name: Obtain SSL certificate with Certbot using webroot
+      command: >
+        certbot certonly --webroot
+        --webroot-path {{ webroot_path }}
+        --email {{ email }}
+        --agree-tos
+        --no-eff-email
+        -d {{ domain_name }}
+      args:
+        creates: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem"
+      notify: Reload nginx
+
+    - name: Setup renew cron job (runs twice a day)
+      cron:
+        name: "Renew Let's Encrypt certificates"
+        job: "/usr/bin/certbot renew --quiet --renew-hook 'systemctl reload {{ webserver_service }}'"
+        user: root
+        minute: 0
+        hour: "*/12"
+
+    - name: Check if letsencrypt certificate exists
+      stat:
+        path: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem"
+      register: stat_cert
+
+    - name: Configure Nginx for SSL if letsencrypt cert present
+      blockinfile:
+        path: "{{ nginx_conf_file }}"
+        insertafter: 'server_name {{ domain_name }};'
+        block: |
+          listen 443 ssl;
+          ssl_certificate /etc/letsencrypt/live/{{ domain_name }}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/{{ domain_name }}/privkey.pem;
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_ciphers HIGH:!aNULL:!MD5;
+
+          # Redirect HTTP to HTTPS
+          if ($scheme != "https") {
+              return 301 https://$host$request_uri;
+          }
+      when: stat_cert.stat.exists
+      notify: Reload nginx
+
+  handlers:
+    - name: Reload nginx
+      systemd:
+        name: "{{ webserver_service }}"
+        state: reloaded
