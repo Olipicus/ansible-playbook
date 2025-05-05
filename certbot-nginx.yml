@@ -1,116 +1,176 @@
 ---
-- name: Install Certbot, obtain HTTPS certificate, and configure Nginx
+# certbot-nginx.yml
+# Comprehensive Ansible playbook for setting up Nginx with HTTPS using Certbot
+# This playbook handles both initial setup and adding new domains
+
+- name: Setup Nginx with HTTPS using Certbot
   hosts: all
   become: yes
-
   vars:
-    domain_name: "{{ domain_name | default('example.com') }}"
-    email: "{{ email | default('admin@example.com') }}"
-    webroot_path: "/var/www/html"
-    webserver_service: "nginx"
-    nginx_sites_available: "/etc/nginx/sites-available"
-    nginx_sites_enabled: "/etc/nginx/sites-enabled"
-    nginx_conf_file: "{{ nginx_sites_available }}/{{ domain_name }}"
-
+    # Domain configuration - can be overridden via extra-vars when running the playbook
+    domains: [] # Example: ["example.com", "www.example.com"]
+    email: "webmaster@example.com" # Used for Let's Encrypt notifications
+    
+    # Directory paths
+    nginx_conf_path: "/etc/nginx"
+    nginx_sites_available: "{{ nginx_conf_path }}/sites-available"
+    nginx_sites_enabled: "{{ nginx_conf_path }}/sites-enabled"
+    web_root: "/var/www"
+    certbot_auto_renewal_hour: "3"
+    certbot_auto_renewal_minute: "30"
+    
+    # Nginx and Certbot settings
+    nginx_default_server_config: |
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+          server_name _;
+          return 444;
+      }
+    
   tasks:
-    - name: Install Nginx and Certbot packages (Ubuntu/Debian)
+    # 1. Install Nginx (but don't start it yet)
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Create default server config to handle unknown domains
+      copy:
+        content: "{{ nginx_default_server_config }}"
+        dest: "{{ nginx_sites_available }}/default"
+      notify: reload nginx
+
+    - name: Enable default server config
+      file:
+        src: "{{ nginx_sites_available }}/default"
+        dest: "{{ nginx_sites_enabled }}/default"
+        state: link
+      notify: reload nginx
+
+    # 2. Install Certbot and dependencies
+    - name: Install Certbot and Nginx plugin
       apt:
         name:
-          - nginx
           - certbot
           - python3-certbot-nginx
         state: present
-        update_cache: yes
 
-    - name: Ensure Nginx is started and enabled
-      systemd:
-        name: "{{ webserver_service }}"
+    # 3. Check if domains are provided
+    - name: Verify domains are specified
+      fail:
+        msg: "You must specify at least one domain in the 'domains' variable"
+      when: domains|length == 0
+
+    # 4. Set up web directories for each domain
+    - name: Create document root directories for domains
+      file:
+        path: "{{ web_root }}/{{ item }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+      loop: "{{ domains }}"
+
+    # 5. Create initial Nginx configurations for each domain (HTTP only)
+    - name: Create Nginx HTTP configs for domains
+      template:
+        src: templates/nginx-http.j2
+        dest: "{{ nginx_sites_available }}/{{ item }}.conf"
+      loop: "{{ domains }}"
+      register: nginx_configs
+      notify: reload nginx
+      vars:
+        # This will be used in the template
+        domain: "{{ item }}"
+        root_path: "{{ web_root }}/{{ item }}"
+
+    # 6. Enable site configurations
+    - name: Enable site configurations
+      file:
+        src: "{{ nginx_sites_available }}/{{ item }}.conf"
+        dest: "{{ nginx_sites_enabled }}/{{ item }}.conf"
+        state: link
+      loop: "{{ domains }}"
+      notify: reload nginx
+
+    # 7. Temporarily start Nginx to validate configs before obtaining certificates
+    - name: Temporarily start Nginx to validate configs
+      service:
+        name: nginx
+        state: started
+      register: nginx_temp_start
+
+    # 8. Obtain SSL certificates for domains
+    - name: Obtain SSL certificates for domains
+      command: certbot --nginx --non-interactive --agree-tos --email {{ email }} -d {{ item }}
+      loop: "{{ domains }}"
+      register: certbot_results
+      changed_when: "'Certificate not yet due for renewal' not in certbot_results.stdout"
+      # Ensures certbot runs only if certificates don't exist or need to be renewed
+      args:
+        creates: "/etc/letsencrypt/live/{{ item }}/fullchain.pem"
+
+    # 9. Now fully start and enable Nginx for permanent operation
+    - name: Ensure Nginx is properly started and enabled
+      service:
+        name: nginx
         state: started
         enabled: yes
 
-    - name: Create basic Nginx config (HTTP only) if not present
-      copy:
-        dest: "{{ nginx_conf_file }}"
-        content: |
-          server {
-              listen 80;
-              server_name {{ domain_name }};
-
-              root {{ webroot_path }};
-              index index.html index.htm;
-
-              location /.well-known/acme-challenge/ {
-                  root {{ webroot_path }};
-              }
-
-              location / {
-                  try_files $uri $uri/ =404;
-              }
-          }
-        owner: root
-        group: root
-        mode: "0644"
-        backup: yes
-        force: no  # Do not overwrite if file exists
-
-    - name: Enable site by creating symlink in sites-enabled
-      file:
-        src: "{{ nginx_conf_file }}"
-        dest: "{{ nginx_sites_enabled }}/{{ domain_name }}"
-        state: link
-      notify: Reload nginx
-
-    - name: Test Nginx configuration
-      command: nginx -t
-      register: nginx_test
-      failed_when: nginx_test.rc != 0
-      changed_when: false
-
-    - name: Obtain SSL certificate with Certbot using webroot
-      command: >
-        certbot certonly --webroot
-        --webroot-path {{ webroot_path }}
-        --email {{ email }}
-        --agree-tos
-        --no-eff-email
-        -d {{ domain_name }}
-      args:
-        creates: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem"
-      notify: Reload nginx
-
-    - name: Setup renew cron job (runs twice a day)
+    # 10. Set up automatic certificate renewal via crontab (runs every 2 days)
+    - name: Set up cron job for certificate renewal
       cron:
-        name: "Renew Let's Encrypt certificates"
-        job: "/usr/bin/certbot renew --quiet --renew-hook 'systemctl reload {{ webserver_service }}'"
+        name: "Renew Let's Encrypt certificates every 2 days"
+        hour: "{{ certbot_auto_renewal_hour }}"
+        minute: "{{ certbot_auto_renewal_minute }}"
+        job: "certbot renew --quiet --nginx --post-hook 'systemctl reload nginx'"
         user: root
-        minute: 0
-        hour: "*/12"
+        day: "*/2"
+        state: present
 
-    - name: Check if letsencrypt certificate exists
-      stat:
-        path: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem"
-      register: stat_cert
+    # 11. Set up domain-specific certificate renewal tasks (optional)
+    - name: Set up domain-specific renewal hooks
+      lineinfile:
+        path: "/etc/letsencrypt/renewal-hooks/post/{{ item | replace('.', '_') }}_reload.sh"
+        line: "#!/bin/bash\nsystemctl reload nginx"
+        create: yes
+        mode: '0755'
+      loop: "{{ domains }}"
 
-    - name: Configure Nginx for SSL if letsencrypt cert present
-      blockinfile:
-        path: "{{ nginx_conf_file }}"
-        insertafter: 'server_name {{ domain_name }};'
-        block: |
-          listen 443 ssl;
-          ssl_certificate /etc/letsencrypt/live/{{ domain_name }}/fullchain.pem;
-          ssl_certificate_key /etc/letsencrypt/live/{{ domain_name }}/privkey.pem;
-          ssl_protocols TLSv1.2 TLSv1.3;
-          ssl_ciphers HIGH:!aNULL:!MD5;
+    # 12. Create test index pages
+    - name: Create test index pages for each domain
+      copy:
+        content: |
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Welcome to {{ item }}</title>
+          </head>
+          <body>
+              <h1>Welcome to {{ item }}</h1>
+              <p>This site is secured with Let's Encrypt!</p>
+          </body>
+          </html>
+        dest: "{{ web_root }}/{{ item }}/index.html"
+        owner: www-data
+        group: www-data
+        mode: '0644'
+      loop: "{{ domains }}"
 
-          # Redirect HTTP to HTTPS
-          if ($scheme != "https") {
-              return 301 https://$host$request_uri;
-          }
-      when: stat_cert.stat.exists
-      notify: Reload nginx
-
+  # Define handlers for service restarts
   handlers:
-    - name: Reload nginx
-      systemd:
-        name: "{{ webserver_service }}"
+    - name: reload nginx
+      service:
+        name: nginx
         state: reloaded
+
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
